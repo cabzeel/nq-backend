@@ -1,14 +1,13 @@
-const express    = require('express');
-const http       = require('http');
-const mongoose   = require('mongoose');
-const cors       = require('cors');
-const helmet     = require('helmet');
-const morgan     = require('morgan');
-const rateLimit  = require('express-rate-limit');
+const express   = require('express');
+const http      = require('http');
+const cors      = require('cors');
+const helmet    = require('helmet');
+const morgan    = require('morgan');
+const rateLimit = require('express-rate-limit');
 const { Server } = require('socket.io');
-require('dotenv').config();
-
+const connectDB   = require('./lib/mongodb');
 const ChatMessage = require('./models/ChatMessage');
+require('dotenv').config();
 
 const app    = express();
 const server = http.createServer(app);
@@ -22,20 +21,25 @@ const allowedOrigins = [
 ].filter(Boolean);
 
 // ── Socket.io ─────────────────────────────────────────────────────────────────
+// IMPORTANT: Vercel does NOT support WebSockets.
+// Force long-polling only so Socket.io works on Vercel serverless.
+// For production WebSocket support, migrate to Railway / Render / a VPS.
 const io = new Server(server, {
   cors: { origin: allowedOrigins, credentials: true },
+  transports: ['polling'],          // no 'websocket' — Vercel blocks it
+  allowEIO3: true,
+  path: '/socket.io',
 });
 
-// Track which admin sockets are connected
 const adminSockets = new Set();
 
-io.on('connection', (socket) => {
+io.on('connection', async (socket) => {
+  await connectDB();
   const { sessionId, visitorName, isAdmin } = socket.handshake.query;
 
   if (isAdmin === 'true') {
     adminSockets.add(socket.id);
     socket.join('admin-room');
-    console.log(`[Chat] Admin connected: ${socket.id}`);
 
     socket.on('admin:join-session', (sid) => socket.join(`session:${sid}`));
 
@@ -47,13 +51,10 @@ io.on('connection', (socket) => {
 
     socket.on('disconnect', () => adminSockets.delete(socket.id));
   } else {
-    // Client
     const sid  = sessionId || socket.id;
     const name = visitorName || 'Guest';
     socket.join(`session:${sid}`);
-    console.log(`[Chat] Client connected: ${sid} (${name})`);
 
-    // Send last 50 messages on join
     ChatMessage.find({ sessionId: sid }).sort({ createdAt: 1 }).limit(50)
       .then(msgs => socket.emit('history', msgs));
 
@@ -62,38 +63,42 @@ io.on('connection', (socket) => {
       const msg = await ChatMessage.create({
         sessionId: sid, sender: 'client', text: text?.trim(), type, imageUrl, visitorName: name,
       });
-      // Deliver to this session room (includes admin if joined)
       io.to(`session:${sid}`).emit('message', msg);
-      // Notify admin room of new client message
       io.to('admin-room').emit('client:new-message', {
-        sessionId: sid, visitorName: name, preview: text?.trim() || '📎 Image', at: msg.createdAt,
+        sessionId: sid, visitorName: name, preview: text?.trim() || 'Image', at: msg.createdAt,
       });
     });
-
-    socket.on('disconnect', () => console.log(`[Chat] Client disconnected: ${sid}`));
   }
 });
 
-// Expose io to routes that need it (order status updates, etc.)
 app.set('io', io);
 
 // ── Security ──────────────────────────────────────────────────────────────────
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    if (allowedOrigins.includes(origin)) return cb(null, true);
+    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
     cb(new Error(`CORS blocked: ${origin}`));
   },
   credentials: true,
 }));
 const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 300 });
 app.use('/api/', limiter);
-
-// ── Body parser ───────────────────────────────────────────────────────────────
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 if (process.env.NODE_ENV !== 'production') app.use(morgan('dev'));
+
+// ── DB middleware — ensures connection before every request ───────────────────
+// Critical for Vercel: each serverless invocation may be a cold start.
+app.use(async (req, res, next) => {
+  try {
+    await connectDB();
+    next();
+  } catch (err) {
+    console.error('DB connection failed:', err.message);
+    res.status(503).json({ success: false, message: 'Database unavailable. Please try again.' });
+  }
+});
 
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/',           (_, res) => res.json({ status: 'NQ Shop API ✅' }));
@@ -127,14 +132,13 @@ app.use((err, req, res, next) => {
   });
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 5000;
-mongoose.connect(process.env.MONGO_URI)
-  .then(() => {
-    console.log('✅ MongoDB connected');
-    server.listen(PORT, () => console.log(`🚀 Server on port ${PORT} (Socket.io enabled)`));
+// ── Start (local dev only — Vercel uses the exported app directly) ────────────
+if (process.env.NODE_ENV !== 'production') {
+  const PORT = process.env.PORT || 5000;
+  connectDB().then(() => {
+    server.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
     require('./config/seedAdmin')();
-  })
-  .catch(err => { console.error('❌ DB error:', err.message); process.exit(1); });
+  }).catch(err => { console.error('❌ DB error:', err.message); process.exit(1); });
+}
 
 module.exports = app;
