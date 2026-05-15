@@ -132,13 +132,15 @@ app.use((err, req, res, next) => {
   });
 });
 
-// ── Start (local dev only — Vercel uses the exported app directly) ────────────
-if (process.env.NODE_ENV !== 'production') {
-  const PORT = process.env.PORT || 5000;
-  connectDB().then(() => {
-    server.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
-    require('./config/seedAdmin')();
-  }).catch(err => { console.error('❌ DB error:', err.message); process.exit(1); });
-}
+// ── Start ─────────────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 5000;
+connectDB().then(() => {
+  server.listen(PORT, () => console.log(`🚀 Server on port ${PORT} (Socket.io enabled)`));
+  require('./config/seedAdmin')();
+}).catch(err => {
+  console.error('❌ DB error:', err.message);
+  process.exit(1);
+});
 
+module.exports = app;
 module.exports = app;
